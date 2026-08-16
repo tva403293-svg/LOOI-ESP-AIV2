@@ -20,14 +20,16 @@ const char* WS_PATH = "/ws/esp32";
 #define SERVO_PIN      15
 #define NEO_PIN        48
 #define NEO_COUNT      1
-#define MIC_I2S_PORT   I2S_NUM_0
-#define MIC_BCLK_PIN   4
-#define MIC_WS_PIN     5
-#define MIC_SD_PIN     6
-#define DAC_I2S_PORT   I2S_NUM_1
-#define DAC_BCLK_PIN   9
-#define DAC_WS_PIN     10
-#define DAC_DIN_PIN    11
+// Match the known-working PCM5100 sample wiring:
+// DAC = I2S_NUM_0 on GPIO 4/5/6, microphone = I2S_NUM_1 on GPIO 16/17/18.
+#define DAC_I2S_PORT   I2S_NUM_0
+#define DAC_BCLK_PIN   4
+#define DAC_WS_PIN     5
+#define DAC_DIN_PIN    6
+#define MIC_I2S_PORT   I2S_NUM_1
+#define MIC_BCLK_PIN   16
+#define MIC_WS_PIN     17
+#define MIC_SD_PIN     18
 
 // LEDC PWM para sa motors
 #define CH_A1  0
@@ -51,12 +53,9 @@ volatile float audioLevel = 0.0f;
 #define DAC_RATE     24000
 #define MIC_CHUNK_SAMPLES 512
 #define MAX_CHUNK_SIZE 16384
-#define DAC_PCM_SAMPLES_PER_CHUNK 256
+#define DAC_WRITE_CHUNK_SIZE 4096
 uint8_t tempBuffer[MAX_CHUNK_SIZE];
 uint8_t b64DecodeBuf[MAX_CHUNK_SIZE];
-// PCM5100/PCM5102 expects standard I2S slots. Gemini sends 16-bit mono PCM,
-// so write a 32-bit sample to both stereo slots (MSB-aligned).
-int32_t dacFrameBuffer[DAC_PCM_SAMPLES_PER_CHUNK * 2];
 
 const int START_THRESHOLD = 260;
 int speech_frames = 0;
@@ -290,33 +289,19 @@ float computeAudioLevel(uint8_t* data, size_t len) {
 }
 
 void writePcmToDac(const uint8_t* data, size_t len) {
-  // Gemini Live returns little-endian 16-bit mono PCM at 24 kHz. The
-  // PCM5100's DATA input uses standard I2S with 32-bit stereo slots, so
-  // expand each input sample to a signed 32-bit MSB-aligned value and copy
-  // it to both channels. This also avoids relying on the ESP32's 16-bit
-  // ONLY_LEFT mode, which can leave PCM5100 modules muted.
-  size_t sampleOffset = 0;
-  const size_t sampleCount = len / sizeof(int16_t);
-  while (sampleOffset < sampleCount) {
-    const size_t samples = min(
-      (size_t)DAC_PCM_SAMPLES_PER_CHUNK,
-      sampleCount - sampleOffset
-    );
-
-    for (size_t i = 0; i < samples; i++) {
-      int16_t monoSample = 0;
-      memcpy(&monoSample, data + ((sampleOffset + i) * sizeof(int16_t)), sizeof(monoSample));
-      const int32_t i2sSample = ((int32_t)monoSample) << 16;
-      dacFrameBuffer[i * 2] = i2sSample;
-      dacFrameBuffer[i * 2 + 1] = i2sSample;
-    }
-
+  // This is the playback path used by the known-working sample: Gemini's
+  // little-endian 16-bit PCM is written directly to the PCM5100's 16-bit
+  // ONLY_LEFT I2S stream. Keep writes bounded and sample-aligned.
+  size_t offset = 0;
+  while (offset < len) {
+    size_t chunk = min((size_t)DAC_WRITE_CHUNK_SIZE, len - offset);
+    if (chunk & 1) chunk--;
+    if (chunk == 0) break;
     size_t bytes_written = 0;
-    const size_t bytesToWrite = samples * 2 * sizeof(int32_t);
     esp_err_t writeErr = i2s_write(
       DAC_I2S_PORT,
-      dacFrameBuffer,
-      bytesToWrite,
+      data + offset,
+      chunk,
       &bytes_written,
       portMAX_DELAY
     );
@@ -324,7 +309,7 @@ void writePcmToDac(const uint8_t* data, size_t len) {
       Serial.printf("[DAC] i2s_write failed: %d\n", writeErr);
       break;
     }
-    sampleOffset += bytes_written / (2 * sizeof(int32_t));
+    offset += bytes_written;
     if (bytes_written == 0) break;
   }
 }
@@ -574,9 +559,9 @@ void setup() {
   i2s_config_t dac_cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = DAC_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 32,
     .dma_buf_len = 512
@@ -601,7 +586,7 @@ void setup() {
     setColor(pixels.Color(255, 0, 0));
     while (true) { delay(500); }
   }
-  Serial.println("[INIT] DAC I2S OK (PCM5100: 24kHz / 32-bit stereo MSB)");
+  Serial.println("[INIT] DAC I2S OK (PCM5100: GPIO 4/5/6, 24kHz / 16-bit ONLY_LEFT)");
 
   Serial.print("[INIT] Free heap before WS: ");
   Serial.println(ESP.getFreeHeap());
