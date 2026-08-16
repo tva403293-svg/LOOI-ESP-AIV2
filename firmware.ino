@@ -59,9 +59,9 @@ uint8_t b64DecodeBuf[MAX_CHUNK_SIZE];
 
 const int START_THRESHOLD = 260;
 int speech_frames = 0;
-const int SPEECH_CONFIRM = 4;
-const int SILENCE_CONFIRM = 12;       // ~384 ms at 512 samples / 16 kHz
-const unsigned long MIN_STREAM_MS = 180;
+const int SPEECH_CONFIRM = 2;         // ~64 ms before opening the stream
+const int SILENCE_CONFIRM = 4;        // ~128 ms at 512 samples / 16 kHz
+const unsigned long MIN_STREAM_MS = 120;
 int silence_frames = 0;
 unsigned long micStreamStartedAt = 0;
 unsigned long micFramesSent = 0;

@@ -43,5 +43,7 @@ resistor); do not connect GPIO 10 directly to a passive speaker. Keep `WS_HOST`
 in `firmware.ino` aligned with the current Replit preview host before flashing.
 The ESP32 does not receive firmware changes automatically, so re-flash the
 sketch after changing `WS_HOST` or the server audio bridge.
+The firmware VAD uses a short four-frame silence endpoint (~128 ms) so the
+reply starts closer to the browser tester's immediate Stop & Send behavior.
 The current firmware also plays a one-second 440 Hz diagnostic tone at boot;
 set `DIRECT_AUDIO_TONE_TEST` to `false` after the amplifier wiring is confirmed.
