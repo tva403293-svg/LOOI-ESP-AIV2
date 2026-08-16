@@ -278,10 +278,14 @@ void applyVolume(uint8_t* data, size_t len, float vol) {
 }
 
 float computeAudioLevel(uint8_t* data, size_t len) {
-  int16_t* samples = (int16_t*)data;
-  int count = len / 2;
+  const int count = len / sizeof(int16_t);
   float sum = 0;
-  for (int i = 0; i < count; i++) { float s = samples[i]; sum += s * s; }
+  for (int i = 0; i < count; i++) {
+    int16_t sample = 0;
+    memcpy(&sample, data + (i * sizeof(int16_t)), sizeof(sample));
+    float s = sample;
+    sum += s * s;
+  }
   return count ? sqrt(sum / count) : 0;
 }
 
@@ -309,7 +313,17 @@ void writePcmToDac(const uint8_t* data, size_t len) {
 
     size_t bytes_written = 0;
     const size_t bytesToWrite = samples * 2 * sizeof(int32_t);
-    i2s_write(DAC_I2S_PORT, dacFrameBuffer, bytesToWrite, &bytes_written, portMAX_DELAY);
+    esp_err_t writeErr = i2s_write(
+      DAC_I2S_PORT,
+      dacFrameBuffer,
+      bytesToWrite,
+      &bytes_written,
+      portMAX_DELAY
+    );
+    if (writeErr != ESP_OK) {
+      Serial.printf("[DAC] i2s_write failed: %d\n", writeErr);
+      break;
+    }
     sampleOffset += bytes_written / (2 * sizeof(int32_t));
     if (bytes_written == 0) break;
   }
@@ -417,8 +431,9 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       setColor(pixels.Color(200, 0, 200));
       audioFramesReceived++;
       if (audioFramesReceived <= 3 || audioFramesReceived % 10 == 0) {
-        Serial.printf("[WS] AI audio frame #%lu (%u bytes)\n",
-                      audioFramesReceived, (unsigned)length);
+        Serial.printf("[WS] AI audio frame #%lu (%u bytes, RMS=%.0f)\n",
+                      audioFramesReceived, (unsigned)length,
+                      computeAudioLevel(payload, length));
       }
 
       writePcmToDac(payload, length);
@@ -561,7 +576,7 @@ void setup() {
     .sample_rate = DAC_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 32,
     .dma_buf_len = 512
@@ -579,7 +594,14 @@ void setup() {
     while (true) { delay(500); }
   }
   i2s_set_pin(DAC_I2S_PORT, &dac_p);
-  Serial.println("[INIT] DAC I2S OK (PCM5100: 24kHz / 32-bit stereo)");
+  i2s_zero_dma_buffer(DAC_I2S_PORT);
+  err = i2s_start(DAC_I2S_PORT);
+  if (err != ESP_OK) {
+    Serial.printf("[ERROR] DAC I2S start failed: %d\n", err);
+    setColor(pixels.Color(255, 0, 0));
+    while (true) { delay(500); }
+  }
+  Serial.println("[INIT] DAC I2S OK (PCM5100: 24kHz / 32-bit stereo MSB)");
 
   Serial.print("[INIT] Free heap before WS: ");
   Serial.println(ESP.getFreeHeap());
