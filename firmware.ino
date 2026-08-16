@@ -8,7 +8,7 @@
 #include <HTTPClient.h>
 
 // ── Server ──────────────────────────────────────────────────────────
-const char* WS_HOST = "080fd642-8b6f-49f5-bb1d-7ad27c6fa6c0-00-19ofuxkmgpdio.sisko.replit.dev";
+const char* WS_HOST = "82f2eb9b-d317-48bd-b741-577aa315165c-00-yw9xcw7q7fpg.pike.replit.dev";
 const int   WS_PORT = 443;
 const char* WS_PATH = "/ws/esp32";
 
@@ -50,7 +50,8 @@ volatile float audioLevel = 0.0f;
 #define MIC_RATE     16000
 #define DAC_RATE     24000
 #define MIC_CHUNK_SAMPLES 512
-#define MAX_CHUNK_SIZE 8192
+#define MAX_CHUNK_SIZE 16384
+#define DAC_WRITE_CHUNK_SIZE 4096
 uint8_t tempBuffer[MAX_CHUNK_SIZE];
 uint8_t b64DecodeBuf[MAX_CHUNK_SIZE];
 
@@ -287,6 +288,21 @@ float computeAudioLevel(uint8_t* data, size_t len) {
   return count ? sqrt(sum / count) : 0;
 }
 
+void writePcmToDac(const uint8_t* data, size_t len) {
+  // Keep I2S writes bounded even if an older server sends a large frame.
+  // Every chunk is an even number of bytes, so 16-bit PCM samples stay aligned.
+  size_t offset = 0;
+  while (offset < len) {
+    size_t chunk = min((size_t)DAC_WRITE_CHUNK_SIZE, len - offset);
+    if (chunk & 1) chunk--;
+    if (chunk == 0) break;
+    size_t bytes_written = 0;
+    i2s_write(DAC_I2S_PORT, data + offset, chunk, &bytes_written, portMAX_DELAY);
+    offset += bytes_written;
+    if (bytes_written == 0) break;
+  }
+}
+
 // --------------------
 // WebSocket
 // --------------------
@@ -369,8 +385,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
               p = tempBuffer;
             }
             audioLevel = computeAudioLevel(p, decoded);
-            size_t bytes_written;
-            i2s_write(DAC_I2S_PORT, p, decoded, &bytes_written, portMAX_DELAY);
+            writePcmToDac(p, decoded);
           }
         }
       }
@@ -394,13 +409,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
                       audioFramesReceived, (unsigned)length);
       }
 
-      if (length <= MAX_CHUNK_SIZE) {
-        size_t bytes_written;
-        i2s_write(DAC_I2S_PORT, payload, length, &bytes_written, portMAX_DELAY);
-      } else {
-        Serial.printf("[WS] AI audio frame too large, dropped (%u bytes)\n",
-                      (unsigned)length);
-      }
+      writePcmToDac(payload, length);
       break;
     }
 

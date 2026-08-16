@@ -321,6 +321,7 @@ app.post('/api/face/register', async (req, res) => {
 // ── WebSocket Server Setup for Phone & ESP32 ─────────────────
 const GEMINI_LIVE_URL = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 const GEMINI_LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || 'models/gemini-3.1-flash-live-preview';
+const ESP32_AUDIO_FRAME_BYTES = 4096;
 
 // CRITICAL FIX: perMessageDeflate=false para hindi mag-compress ang data papuntang ESP32
 const geminiLiveWss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
@@ -404,6 +405,13 @@ function attachGeminiLive(clientWs, request, { target = 'web' } = {}) {
     }
   };
 
+  const sendEsp32Audio = (pcm) => {
+    for (let offset = 0; offset < pcm.length; offset += ESP32_AUDIO_FRAME_BYTES) {
+      if (clientWs.readyState !== WebSocket.OPEN) return;
+      clientWs.send(pcm.subarray(offset, Math.min(offset + ESP32_AUDIO_FRAME_BYTES, pcm.length)));
+    }
+  };
+
   const sendUpstreamOrQueue = (message) => {
     if (ready && gemWs.readyState === WebSocket.OPEN) {
       gemWs.send(message);
@@ -483,8 +491,10 @@ function attachGeminiLive(clientWs, request, { target = 'web' } = {}) {
           outputAudioFrames++;
           if (clientWs.readyState === WebSocket.OPEN) {
             if (target === 'esp32') {
-              // Send raw PCM as BINARY frame — ESP32 handles this in WStype_BIN
-              clientWs.send(rawPcm);
+              // Keep binary frames small enough for ESP32 WebSockets/I2S buffers.
+              // Gemini can return 9–14 KB chunks, while the device consumes them
+              // incrementally; never make the firmware drop a complete response.
+              sendEsp32Audio(rawPcm);
             } else {
               // Web/phone client gets the JSON wrapper
               clientWs.send(str);

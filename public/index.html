@@ -153,6 +153,7 @@
       const samples = decodePcm16(base64);
       if (!samples.length) return;
       if (!audioContext || audioContext.state === 'closed') audioContext = new AudioContext();
+      if (audioContext.state === 'suspended') audioContext.resume();
       const buffer = audioContext.createBuffer(1, samples.length, 24000);
       buffer.getChannelData(0).set(samples);
       const source = audioContext.createBufferSource();
@@ -187,18 +188,34 @@
           } else {
             log('[WS] Server connected — Gemini session is starting');
           }
-        } else if (message.inlineData) {
-          playPcm(message.inlineData.data);
-          setTesterState('Gemini is speaking');
-          log(`[AUDIO] Gemini response audio received (${Math.round(message.inlineData.data.length * 0.75)} bytes encoded)`);
-        } else if (message.serverContent?.turnComplete) {
-          log(`[AUDIO] PLAYBACK_END — Gemini turn complete (${sentAudioFrames} mic frames sent)`);
-          setTesterState('Reply complete — ready for another test');
-          awaitingResponse = false;
-          startButton.disabled = false;
-          setTimeout(closeTesterSocket, 500);
-        } else if (message.robotAction) {
-          log(`[ROBOT] ${message.robotAction.move || 'NONE'} / ${message.robotAction.led || 'NONE'}`);
+        } else {
+          // Gemini Live nests audio under modelTurn.parts[].inlineData.
+          // The bridge forwards the original Gemini event to the browser, so
+          // inspect the nested parts rather than looking for a root inlineData.
+          const audioParts = message.serverContent?.modelTurn?.parts
+            ?.map(part => part.inlineData)
+            .filter(inlineData => inlineData?.data) || [];
+          if (audioParts.length) {
+            for (const audio of audioParts) playPcm(audio.data);
+            setTesterState('Gemini is speaking');
+            const bytes = audioParts.reduce((total, audio) => total + Math.round(audio.data.length * 0.75), 0);
+            log(`[AUDIO] Gemini response audio received (${bytes} PCM bytes)`);
+          }
+          if (message.serverContent?.interrupted) {
+            nextPlaybackTime = 0;
+            log('[AUDIO] Gemini interrupted the current reply');
+            setTesterState('Reply interrupted');
+          }
+          if (message.serverContent?.turnComplete) {
+            log(`[AUDIO] PLAYBACK_END — Gemini turn complete (${sentAudioFrames} mic frames sent)`);
+            setTesterState('Reply complete — ready for another test');
+            awaitingResponse = false;
+            startButton.disabled = false;
+            setTimeout(closeTesterSocket, 500);
+          }
+          if (message.robotAction) {
+            log(`[ROBOT] ${message.robotAction.move || 'NONE'} / ${message.robotAction.led || 'NONE'}`);
+          }
         }
       };
       socket.onerror = () => {
@@ -262,6 +279,7 @@
         testerSocket.send(JSON.stringify({ event: 'start_stream' }));
         micStreaming = true;
         awaitingResponse = false;
+         nextPlaybackTime = 0;
         sentAudioFrames = 0;
         sentAudioBytes = 0;
         stopButton.disabled = false;

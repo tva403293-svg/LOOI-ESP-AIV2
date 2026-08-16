@@ -33,5 +33,8 @@ The ESP32 firmware uses `WebSocketsClient`'s built-in reconnect loop. Its
 15-second JSON keepalive is handled by the server as a local pong and is not
 forwarded to Gemini Live. After changing `firmware.ino`, flash the sketch to
 the ESP32 and monitor the serial log for `[WS] Connected ✓` and
-`[WS] Server hello/keepalive ack` and `[AUDIO] PLAYBACK_END`. Keep `WS_HOST` in
-`firmware.ino` aligned with the current Replit preview host before flashing.
+`[WS] Server hello/keepalive ack`, AI audio frames, and `[AUDIO] PLAYBACK_END`.
+The server splits Gemini's larger PCM responses into 4096-byte binary frames,
+and the firmware also splits oversized frames before writing them to I2S so
+audio is not silently dropped. Keep `WS_HOST` in `firmware.ino` aligned with
+the current Replit preview host before flashing.
