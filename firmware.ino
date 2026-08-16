@@ -8,7 +8,7 @@
 #include <HTTPClient.h>
 
 // ── Server ──────────────────────────────────────────────────────────
-const char* WS_HOST = "67279968-4633-423d-81c9-5281eeecb78d-00-3a3mpsreuymjb.sisko.replit.dev";
+const char* WS_HOST = "ff207455-ad3a-4d18-9332-13002c083402-00-5zvalhtzkiyh.sisko.replit.dev";
 const int   WS_PORT = 443;
 const char* WS_PATH = "/ws/esp32";
 
@@ -20,12 +20,13 @@ const char* WS_PATH = "/ws/esp32";
 #define SERVO_PIN      15
 #define NEO_PIN        48
 #define NEO_COUNT      1
-// Match the known-working PCM5100 sample wiring:
-// DAC = I2S_NUM_0 on GPIO 4/5/6, microphone = I2S_NUM_1 on GPIO 16/17/18.
-#define DAC_I2S_PORT   I2S_NUM_0
-#define DAC_BCLK_PIN   4
-#define DAC_WS_PIN     5
-#define DAC_DIN_PIN    6
+// Direct speaker/amp output: GPIO 10 is driven by a high-frequency PWM
+// carrier. The amplifier/speaker input turns the changing duty cycle into
+// the PCM waveform, so no external I2S DAC is needed.
+#define AUDIO_GPIO     10
+#define AUDIO_PWM_FREQ 78125
+#define AUDIO_PWM_RES  8
+#define AUDIO_PWM_CH   4
 #define MIC_I2S_PORT   I2S_NUM_1
 #define MIC_BCLK_PIN   16
 #define MIC_WS_PIN     17
@@ -50,10 +51,9 @@ float currentVolume = 0.32f;
 volatile float audioLevel = 0.0f;
 
 #define MIC_RATE     16000
-#define DAC_RATE     24000
+#define AUDIO_RATE   24000
 #define MIC_CHUNK_SAMPLES 512
 #define MAX_CHUNK_SIZE 16384
-#define DAC_WRITE_CHUNK_SIZE 4096
 uint8_t tempBuffer[MAX_CHUNK_SIZE];
 uint8_t b64DecodeBuf[MAX_CHUNK_SIZE];
 
@@ -288,29 +288,57 @@ float computeAudioLevel(uint8_t* data, size_t len) {
   return count ? sqrt(sum / count) : 0;
 }
 
-void writePcmToDac(const uint8_t* data, size_t len) {
-  // This is the playback path used by the known-working sample: Gemini's
-  // little-endian 16-bit PCM is written directly to the PCM5100's 16-bit
-  // ONLY_LEFT I2S stream. Keep writes bounded and sample-aligned.
-  size_t offset = 0;
-  while (offset < len) {
-    size_t chunk = min((size_t)DAC_WRITE_CHUNK_SIZE, len - offset);
-    if (chunk & 1) chunk--;
-    if (chunk == 0) break;
-    size_t bytes_written = 0;
-    esp_err_t writeErr = i2s_write(
-      DAC_I2S_PORT,
-      data + offset,
-      chunk,
-      &bytes_written,
-      portMAX_DELAY
-    );
-    if (writeErr != ESP_OK) {
-      Serial.printf("[DAC] i2s_write failed: %d\n", writeErr);
-      break;
+void audioPwmWrite(uint8_t duty) {
+  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    ledcWrite(AUDIO_GPIO, duty);
+  #else
+    ledcWrite(AUDIO_PWM_CH, duty);
+  #endif
+}
+
+void setupDirectAudio() {
+  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    if (!ledcAttach(AUDIO_GPIO, AUDIO_PWM_FREQ, AUDIO_PWM_RES)) {
+      Serial.println("[ERROR] Direct audio PWM attach failed");
+      return;
     }
-    offset += bytes_written;
-    if (bytes_written == 0) break;
+  #else
+    ledcSetup(AUDIO_PWM_CH, AUDIO_PWM_FREQ, AUDIO_PWM_RES);
+    ledcAttachPin(AUDIO_GPIO, AUDIO_PWM_CH);
+  #endif
+
+  // 50% duty is the silent midpoint for signed PCM.
+  audioPwmWrite(128);
+  Serial.printf("[INIT] Direct GPIO audio OK (GPIO %d, PWM %dHz / %dbit, PCM %dHz)\n",
+                AUDIO_GPIO, AUDIO_PWM_FREQ, AUDIO_PWM_RES, AUDIO_RATE);
+}
+
+void writePcmToGpio(const uint8_t* data, size_t len) {
+  // Gemini sends little-endian signed 16-bit PCM at 24 kHz. Each sample is
+  // represented by the duty cycle of a much faster PWM carrier. This is a
+  // DAC-less output path: connect GPIO 10 through a small series capacitor
+  // (and preferably a 1k resistor) to the amplifier's audio input.
+  const size_t sampleCount = len / sizeof(int16_t);
+  if (sampleCount == 0) return;
+
+  const uint32_t samplePeriodUs = 1000000UL / AUDIO_RATE;
+  uint32_t nextSampleAt = micros();
+  const int16_t* samples = reinterpret_cast<const int16_t*>(data);
+
+  for (size_t i = 0; i < sampleCount; i++) {
+    // Convert signed 16-bit PCM [-32768, 32767] to unsigned 8-bit duty.
+    const int32_t unsignedSample = (int32_t)samples[i] + 32768;
+    audioPwmWrite((uint8_t)(unsignedSample >> 8));
+
+    nextSampleAt += samplePeriodUs;
+    const int32_t waitUs = (int32_t)(nextSampleAt - micros());
+    if (waitUs > 0) {
+      delayMicroseconds((uint32_t)waitUs);
+    } else {
+      // If a callback briefly overruns, restart the schedule instead of
+      // accumulating delay and making the next frames increasingly late.
+      nextSampleAt = micros();
+    }
   }
 }
 
@@ -396,7 +424,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
               p = tempBuffer;
             }
             audioLevel = computeAudioLevel(p, decoded);
-            writePcmToDac(p, decoded);
+             writePcmToGpio(p, decoded);
           }
         }
       }
@@ -421,7 +449,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
                       computeAudioLevel(payload, length));
       }
 
-      writePcmToDac(payload, length);
+       writePcmToGpio(payload, length);
       break;
     }
 
@@ -555,38 +583,7 @@ void setup() {
   i2s_set_pin(MIC_I2S_PORT, &mic_p);
   Serial.println("[INIT] Mic I2S OK");
 
-  Serial.println("[INIT] Installing DAC I2S...");
-  i2s_config_t dac_cfg = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = DAC_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 32,
-    .dma_buf_len = 512
-  };
-  i2s_pin_config_t dac_p = {
-    .bck_io_num = DAC_BCLK_PIN,
-    .ws_io_num = DAC_WS_PIN,
-    .data_out_num = DAC_DIN_PIN,
-    .data_in_num = I2S_PIN_NO_CHANGE
-  };
-  err = i2s_driver_install(DAC_I2S_PORT, &dac_cfg, 0, NULL);
-  if (err != ESP_OK) {
-    Serial.printf("[ERROR] DAC I2S install failed: %d\n", err);
-    setColor(pixels.Color(255, 0, 0));
-    while (true) { delay(500); }
-  }
-  i2s_set_pin(DAC_I2S_PORT, &dac_p);
-  i2s_zero_dma_buffer(DAC_I2S_PORT);
-  err = i2s_start(DAC_I2S_PORT);
-  if (err != ESP_OK) {
-    Serial.printf("[ERROR] DAC I2S start failed: %d\n", err);
-    setColor(pixels.Color(255, 0, 0));
-    while (true) { delay(500); }
-  }
-  Serial.println("[INIT] DAC I2S OK (PCM5100: GPIO 4/5/6, 24kHz / 16-bit ONLY_LEFT)");
+  setupDirectAudio();
 
   Serial.print("[INIT] Free heap before WS: ");
   Serial.println(ESP.getFreeHeap());
