@@ -40,3 +40,5 @@ GPIO 10, so no external I2S/PCM5100 DAC is required. Connect GPIO 10 to the
 amplifier's audio input through a series capacitor (and preferably a 1 kOhm
 resistor); do not connect GPIO 10 directly to a passive speaker. Keep `WS_HOST`
 in `firmware.ino` aligned with the current Replit preview host before flashing.
+The current firmware also plays a one-second 440 Hz diagnostic tone at boot;
+set `DIRECT_AUDIO_TONE_TEST` to `false` after the amplifier wiring is confirmed.

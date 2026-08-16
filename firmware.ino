@@ -84,6 +84,9 @@ const IPAddress CLOUDFLARE_DNS(1, 1, 1, 1);
 
 // Debug mode: i-set to true para i-disable ang audio sending (test connection stability)
 const bool AUDIO_TEST_MODE = false;
+// Temporary hardware diagnostic. Set to false after confirming the 440 Hz
+// tone is audible from the amplifier input.
+const bool DIRECT_AUDIO_TONE_TEST = true;
 
 // --------------------
 // Debug helpers
@@ -313,6 +316,19 @@ void setupDirectAudio() {
                 AUDIO_GPIO, AUDIO_PWM_FREQ, AUDIO_PWM_RES, AUDIO_RATE);
 }
 
+void playDirectToneTest() {
+  Serial.println("[AUDIO TEST] GPIO 10: 440Hz tone for 1 second");
+  const uint16_t halfPeriodUs = 1136; // approximately 440 Hz
+  for (int i = 0; i < 440; i++) {
+    audioPwmWrite(255);
+    delayMicroseconds(halfPeriodUs);
+    audioPwmWrite(0);
+    delayMicroseconds(halfPeriodUs);
+  }
+  audioPwmWrite(128);
+  Serial.println("[AUDIO TEST] Tone ended");
+}
+
 void writePcmToGpio(const uint8_t* data, size_t len) {
   // Gemini sends little-endian signed 16-bit PCM at 24 kHz. Each sample is
   // represented by the duty cycle of a much faster PWM carrier. This is a
@@ -424,7 +440,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
               p = tempBuffer;
             }
             audioLevel = computeAudioLevel(p, decoded);
-             writePcmToGpio(p, decoded);
+            writePcmToGpio(p, decoded);
           }
         }
       }
@@ -449,7 +465,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
                       computeAudioLevel(payload, length));
       }
 
-       writePcmToGpio(payload, length);
+      writePcmToGpio(payload, length);
       break;
     }
 
@@ -584,6 +600,7 @@ void setup() {
   Serial.println("[INIT] Mic I2S OK");
 
   setupDirectAudio();
+  if (DIRECT_AUDIO_TONE_TEST) playDirectToneTest();
 
   Serial.print("[INIT] Free heap before WS: ");
   Serial.println(ESP.getFreeHeap());
