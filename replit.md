@@ -35,15 +35,15 @@ forwarded to Gemini Live. After changing `firmware.ino`, flash the sketch to
 the ESP32 and monitor the serial log for `[WS] Connected ✓` and
 `[WS] Server hello/keepalive ack`, AI audio frames, and `[AUDIO] PLAYBACK_END`.
 The server splits Gemini's larger PCM responses into 2048-byte binary frames
-for compatibility with ESP32 WebSocketsClient audio callbacks.
-The firmware now plays those 24 kHz, 16-bit PCM frames through hardware PWM on
-GPIO 10, so no external I2S/PCM5100 DAC is required. Connect GPIO 10 to the
-amplifier's audio input through a series capacitor (and preferably a 1 kOhm
-resistor); do not connect GPIO 10 directly to a passive speaker. Keep `WS_HOST`
-in `firmware.ino` aligned with the current Replit preview host before flashing.
+for compatibility with ESP32 WebSocketsClient audio callbacks. The firmware
+plays those 24 kHz, 16-bit mono PCM frames through the PCM5102 using standard
+stereo I2S: BCK GPIO 4, WS/LRCK GPIO 5, and DIN GPIO 6. Connect the PCM5102
+analog output to the amplifier/speaker and keep its power and ground common
+with the ESP32. Keep `WS_HOST` in `firmware.ino` aligned with the current
+Replit preview host before flashing.
 The ESP32 does not receive firmware changes automatically, so re-flash the
 sketch after changing `WS_HOST` or the server audio bridge.
 The firmware VAD uses a short four-frame silence endpoint (~128 ms) so the
 reply starts closer to the browser tester's immediate Stop & Send behavior.
-The current firmware also plays a one-second 440 Hz diagnostic tone at boot;
-set `DIRECT_AUDIO_TONE_TEST` to `false` after the amplifier wiring is confirmed.
+The current firmware also plays a one-second 440 Hz PCM5102 diagnostic tone at
+boot; set `PCM5102_TONE_TEST` to `false` after the DAC wiring is confirmed.

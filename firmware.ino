@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <rom/rtc.h>
 #include <HTTPClient.h>
+#include <math.h>
 
 // ── Server ──────────────────────────────────────────────────────────
 const char* WS_HOST = "f0fd1c53-240c-4836-a0a2-4bf6391eb499-00-1zxt1e2huj9to.sisko.replit.dev";
@@ -20,13 +21,13 @@ const char* WS_PATH = "/ws/esp32";
 #define SERVO_PIN      15
 #define NEO_PIN        48
 #define NEO_COUNT      1
-// Direct speaker/amp output: GPIO 10 is driven by a high-frequency PWM
-// carrier. The amplifier/speaker input turns the changing duty cycle into
-// the PCM waveform, so no external I2S DAC is needed.
-#define AUDIO_GPIO     10
-#define AUDIO_PWM_FREQ 78125
-#define AUDIO_PWM_RES  8
-#define AUDIO_PWM_CH   4
+// PCM5102 I2S output. The PCM5102 receives standard stereo I2S while
+// Gemini's Live response is mono PCM, so the playback helper duplicates
+// each sample to left and right channels.
+#define DAC_I2S_PORT   I2S_NUM_0
+#define DAC_BCLK_PIN   4
+#define DAC_WS_PIN     5
+#define DAC_DATA_PIN   6
 #define MIC_I2S_PORT   I2S_NUM_1
 #define MIC_BCLK_PIN   16
 #define MIC_WS_PIN     17
@@ -84,9 +85,10 @@ const IPAddress CLOUDFLARE_DNS(1, 1, 1, 1);
 
 // Debug mode: i-set to true para i-disable ang audio sending (test connection stability)
 const bool AUDIO_TEST_MODE = false;
-// Temporary hardware diagnostic. Set to false after confirming the 440 Hz
-// tone is audible from the amplifier input.
-const bool DIRECT_AUDIO_TONE_TEST = true;
+// Temporary PCM5102 diagnostic. Set to false after confirming the 440 Hz
+// tone is audible from the DAC/amplifier.
+const bool PCM5102_TONE_TEST = true;
+bool dacReady = false;
 
 // --------------------
 // Debug helpers
@@ -291,71 +293,81 @@ float computeAudioLevel(uint8_t* data, size_t len) {
   return count ? sqrt(sum / count) : 0;
 }
 
-void audioPwmWrite(uint8_t duty) {
-  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
-    ledcWrite(AUDIO_GPIO, duty);
-  #else
-    ledcWrite(AUDIO_PWM_CH, duty);
-  #endif
-}
+void setupPcm5102() {
+  i2s_config_t dac_cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = AUDIO_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256,
+    .use_apll = false,
+    .tx_desc_auto_clear = true
+  };
+  i2s_pin_config_t dac_pins = {
+    .bck_io_num = DAC_BCLK_PIN,
+    .ws_io_num = DAC_WS_PIN,
+    .data_out_num = DAC_DATA_PIN,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
 
-void setupDirectAudio() {
-  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
-    if (!ledcAttach(AUDIO_GPIO, AUDIO_PWM_FREQ, AUDIO_PWM_RES)) {
-      Serial.println("[ERROR] Direct audio PWM attach failed");
-      return;
-    }
-  #else
-    ledcSetup(AUDIO_PWM_CH, AUDIO_PWM_FREQ, AUDIO_PWM_RES);
-    ledcAttachPin(AUDIO_GPIO, AUDIO_PWM_CH);
-  #endif
-
-  // 50% duty is the silent midpoint for signed PCM.
-  audioPwmWrite(128);
-  Serial.printf("[INIT] Direct GPIO audio OK (GPIO %d, PWM %dHz / %dbit, PCM %dHz)\n",
-                AUDIO_GPIO, AUDIO_PWM_FREQ, AUDIO_PWM_RES, AUDIO_RATE);
-}
-
-void playDirectToneTest() {
-  Serial.println("[AUDIO TEST] GPIO 10: 440Hz tone for 1 second");
-  const uint16_t halfPeriodUs = 1136; // approximately 440 Hz
-  for (int i = 0; i < 440; i++) {
-    audioPwmWrite(255);
-    delayMicroseconds(halfPeriodUs);
-    audioPwmWrite(0);
-    delayMicroseconds(halfPeriodUs);
+  esp_err_t err = i2s_driver_install(DAC_I2S_PORT, &dac_cfg, 0, NULL);
+  if (err != ESP_OK) {
+    Serial.printf("[ERROR] PCM5102 I2S install failed: %d\n", err);
+    return;
   }
-  audioPwmWrite(128);
-  Serial.println("[AUDIO TEST] Tone ended");
+  err = i2s_set_pin(DAC_I2S_PORT, &dac_pins);
+  if (err != ESP_OK) {
+    Serial.printf("[ERROR] PCM5102 I2S pins failed: %d\n", err);
+    i2s_driver_uninstall(DAC_I2S_PORT);
+    return;
+  }
+  i2s_zero_dma_buffer(DAC_I2S_PORT);
+  dacReady = true;
+  Serial.printf("[INIT] PCM5102 DAC I2S OK (BCK GPIO %d, WS GPIO %d, DIN GPIO %d, %dkHz)\n",
+                DAC_BCLK_PIN, DAC_WS_PIN, DAC_DATA_PIN, AUDIO_RATE / 1000);
 }
 
-void writePcmToGpio(const uint8_t* data, size_t len) {
-  // Gemini sends little-endian signed 16-bit PCM at 24 kHz. Each sample is
-  // represented by the duty cycle of a much faster PWM carrier. This is a
-  // DAC-less output path: connect GPIO 10 through a small series capacitor
-  // (and preferably a 1k resistor) to the amplifier's audio input.
-  const size_t sampleCount = len / sizeof(int16_t);
-  if (sampleCount == 0) return;
-
-  const uint32_t samplePeriodUs = 1000000UL / AUDIO_RATE;
-  uint32_t nextSampleAt = micros();
-  const int16_t* samples = reinterpret_cast<const int16_t*>(data);
+void writeStereoPcm(const int16_t* samples, size_t sampleCount) {
+  static int16_t stereoBuffer[(MAX_CHUNK_SIZE / sizeof(int16_t)) * 2];
+  if (!dacReady || sampleCount == 0) return;
 
   for (size_t i = 0; i < sampleCount; i++) {
-    // Convert signed 16-bit PCM [-32768, 32767] to unsigned 8-bit duty.
-    const int32_t unsignedSample = (int32_t)samples[i] + 32768;
-    audioPwmWrite((uint8_t)(unsignedSample >> 8));
-
-    nextSampleAt += samplePeriodUs;
-    const int32_t waitUs = (int32_t)(nextSampleAt - micros());
-    if (waitUs > 0) {
-      delayMicroseconds((uint32_t)waitUs);
-    } else {
-      // If a callback briefly overruns, restart the schedule instead of
-      // accumulating delay and making the next frames increasingly late.
-      nextSampleAt = micros();
-    }
+    stereoBuffer[i * 2] = samples[i];
+    stereoBuffer[i * 2 + 1] = samples[i];
   }
+
+  size_t bytesWritten = 0;
+  i2s_write(DAC_I2S_PORT, stereoBuffer, sampleCount * 2 * sizeof(int16_t),
+            &bytesWritten, portMAX_DELAY);
+}
+
+void playPcm5102ToneTest() {
+  Serial.println("[AUDIO TEST] PCM5102 I2S: 440Hz tone for 1 second");
+  static int16_t toneBuffer[256 * 2];
+  const size_t toneSamples = sizeof(toneBuffer) / (2 * sizeof(int16_t));
+
+  for (size_t offset = 0; offset < AUDIO_RATE; offset += toneSamples) {
+    const size_t count = min(toneSamples, (size_t)AUDIO_RATE - offset);
+    for (size_t i = 0; i < count; i++) {
+      const float phase = 2.0f * 3.14159265359f * 440.0f *
+                          (float)(offset + i) / AUDIO_RATE;
+      const int16_t sample = (int16_t)(sinf(phase) * 20000.0f);
+      toneBuffer[i * 2] = sample;
+      toneBuffer[i * 2 + 1] = sample;
+    }
+    size_t bytesWritten = 0;
+    i2s_write(DAC_I2S_PORT, toneBuffer, count * 2 * sizeof(int16_t),
+              &bytesWritten, portMAX_DELAY);
+  }
+  Serial.println("[AUDIO TEST] PCM5102 tone ended");
+}
+
+void writePcmToPcm5102(const uint8_t* data, size_t len) {
+  // Gemini sends little-endian signed 16-bit mono PCM at 24 kHz.
+  writeStereoPcm(reinterpret_cast<const int16_t*>(data), len / sizeof(int16_t));
 }
 
 // --------------------
@@ -440,7 +452,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
               p = tempBuffer;
             }
             audioLevel = computeAudioLevel(p, decoded);
-            writePcmToGpio(p, decoded);
+            writePcmToPcm5102(p, decoded);
           }
         }
       }
@@ -465,7 +477,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
                       computeAudioLevel(payload, length));
       }
 
-      writePcmToGpio(payload, length);
+      writePcmToPcm5102(payload, length);
       break;
     }
 
@@ -599,8 +611,8 @@ void setup() {
   i2s_set_pin(MIC_I2S_PORT, &mic_p);
   Serial.println("[INIT] Mic I2S OK");
 
-  setupDirectAudio();
-  if (DIRECT_AUDIO_TONE_TEST) playDirectToneTest();
+  setupPcm5102();
+  if (PCM5102_TONE_TEST && dacReady) playPcm5102ToneTest();
 
   Serial.print("[INIT] Free heap before WS: ");
   Serial.println(ESP.getFreeHeap());
