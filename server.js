@@ -321,7 +321,11 @@ app.post('/api/face/register', async (req, res) => {
 // ── WebSocket Server Setup for Phone & ESP32 ─────────────────
 const GEMINI_LIVE_URL = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 const GEMINI_LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || 'models/gemini-3.1-flash-live-preview';
-const ESP32_AUDIO_FRAME_BYTES = 4096;
+// Keep downstream PCM frames small for ESP32 WebSocketsClient variants.
+// Some firmware builds accept the connection but drop larger frames while
+// their audio callback is busy playing PCM.
+const ESP32_AUDIO_FRAME_BYTES = 2048;
+const MAX_QUEUED_UPSTREAM_BYTES = 512 * 1024;
 
 // CRITICAL FIX: perMessageDeflate=false para hindi mag-compress ang data papuntang ESP32
 const geminiLiveWss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
@@ -395,6 +399,7 @@ function attachGeminiLive(clientWs, request, { target = 'web' } = {}) {
   const gemWs = new WebSocket(`${GEMINI_LIVE_URL}?key=${apiKey}`);
   let ready = false;
   const audioQueue = [];
+  let audioQueueBytes = 0;
   let inputStreamActive = false;
   let inputAudioFrames = 0;
   let outputAudioFrames = 0;
@@ -412,13 +417,23 @@ function attachGeminiLive(clientWs, request, { target = 'web' } = {}) {
     }
   };
 
+  const queueUpstream = (message) => {
+    const messageBytes = Buffer.byteLength(message);
+    // Keep the newest audio and the end marker without allowing a long
+    // utterance to grow memory indefinitely while setup is in progress.
+    while (audioQueue.length && audioQueueBytes + messageBytes > MAX_QUEUED_UPSTREAM_BYTES) {
+      audioQueueBytes -= Buffer.byteLength(audioQueue.shift());
+    }
+    audioQueue.push(message);
+    audioQueueBytes += messageBytes;
+  };
+
   const sendUpstreamOrQueue = (message) => {
     if (ready && gemWs.readyState === WebSocket.OPEN) {
       gemWs.send(message);
       return;
     }
-    audioQueue.push(message);
-    if (audioQueue.length > 50) audioQueue.shift();
+    queueUpstream(message);
   };
 
   sendClientJson({ serverHello: { status: 'connecting', target } });
@@ -530,8 +545,11 @@ function attachGeminiLive(clientWs, request, { target = 'web' } = {}) {
         serverHello: { status: 'ready', target, model: GEMINI_LIVE_MODEL },
         setupComplete: true,
       });
-      for (const c of audioQueue) { if (gemWs.readyState === WebSocket.OPEN) gemWs.send(c); }
+      for (const c of audioQueue) {
+        if (gemWs.readyState === WebSocket.OPEN) gemWs.send(c);
+      }
       audioQueue.length = 0;
+      audioQueueBytes = 0;
     }
   });
 
@@ -575,8 +593,7 @@ function attachGeminiLive(clientWs, request, { target = 'web' } = {}) {
           } else {
             // Keep the end marker after queued audio. Without it, a short
             // first utterance can remain open forever while setup completes.
-            audioQueue.push(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
-            if (audioQueue.length > 50) audioQueue.shift();
+            queueUpstream(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
             console.log(`[GeminiLive:${cid}] audioStreamEnd queued until Gemini setup completes`);
           }
           return;

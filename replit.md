@@ -34,11 +34,14 @@ The ESP32 firmware uses `WebSocketsClient`'s built-in reconnect loop. Its
 forwarded to Gemini Live. After changing `firmware.ino`, flash the sketch to
 the ESP32 and monitor the serial log for `[WS] Connected ✓` and
 `[WS] Server hello/keepalive ack`, AI audio frames, and `[AUDIO] PLAYBACK_END`.
-The server splits Gemini's larger PCM responses into 4096-byte binary frames.
+The server splits Gemini's larger PCM responses into 2048-byte binary frames
+for compatibility with ESP32 WebSocketsClient audio callbacks.
 The firmware now plays those 24 kHz, 16-bit PCM frames through hardware PWM on
 GPIO 10, so no external I2S/PCM5100 DAC is required. Connect GPIO 10 to the
 amplifier's audio input through a series capacitor (and preferably a 1 kOhm
 resistor); do not connect GPIO 10 directly to a passive speaker. Keep `WS_HOST`
 in `firmware.ino` aligned with the current Replit preview host before flashing.
+The ESP32 does not receive firmware changes automatically, so re-flash the
+sketch after changing `WS_HOST` or the server audio bridge.
 The current firmware also plays a one-second 440 Hz diagnostic tone at boot;
 set `DIRECT_AUDIO_TONE_TEST` to `false` after the amplifier wiring is confirmed.

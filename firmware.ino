@@ -8,7 +8,7 @@
 #include <HTTPClient.h>
 
 // ── Server ──────────────────────────────────────────────────────────
-const char* WS_HOST = "ff207455-ad3a-4d18-9332-13002c083402-00-5zvalhtzkiyh.sisko.replit.dev";
+const char* WS_HOST = "f0fd1c53-240c-4836-a0a2-4bf6391eb499-00-1zxt1e2huj9to.sisko.replit.dev";
 const int   WS_PORT = 443;
 const char* WS_PATH = "/ws/esp32";
 
